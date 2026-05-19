@@ -9,6 +9,26 @@ const os = require('os');
 const { spawnSync } = require('child_process');
 const { AudioTranscriptionError } = require('./errors');
 
+// Suppress noisy ONNX Runtime native warnings such as
+// "Removing initializer ... It is not used by any node".
+process.env.ORT_LOGGING_LEVEL = process.env.ORT_LOGGING_LEVEL || '4';
+process.env.ORT_LOG_SEVERITY_LEVEL = process.env.ORT_LOG_SEVERITY_LEVEL || '4';
+
+function installOnnxRuntimeLogFilter() {
+  if (process.stderr.__onnxRuntimeFilterInstalled) return;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, encoding, callback) => {
+    const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+    if (text.includes('[W:onnxruntime') || text.includes('Removing initializer')) {
+      if (typeof callback === 'function') callback();
+      return true;
+    }
+    return originalWrite(chunk, encoding, callback);
+  };
+  process.stderr.__onnxRuntimeFilterInstalled = true;
+}
+installOnnxRuntimeLogFilter();
+
 class NodeAudioProcessor {
   constructor() {
     this.tempDir = os.tmpdir();
