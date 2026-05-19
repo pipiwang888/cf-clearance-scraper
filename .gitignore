@@ -116,3 +116,13 @@ Thumbs.db
 test-results/
 playwright-report/
 playwright/.cache/
+# Local generated artifacts
+*.bak
+*.bak.*
+.env.bak*
+tmp_recaptcha_audio.*
+NUL
+/tools/
+service.log
+service.err.log
+
