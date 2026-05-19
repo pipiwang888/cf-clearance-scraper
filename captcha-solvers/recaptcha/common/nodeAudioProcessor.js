@@ -123,8 +123,6 @@ class NodeAudioProcessor {
       }
       
       console.log(`📥 加载 Whisper 模型 ${whisperModel}（首次运行可能需要几分钟下载）...`);
-      console.log(`📦 Transformers cache: ${cacheDir}`);
-      console.log(`🌐 Transformers remote host: ${env.remoteHost || 'https://huggingface.co'}`);
       
       // 使用较小的 Whisper 模型以节省内存和提高速度
       this.whisperPipeline = await pipeline(
@@ -404,7 +402,6 @@ class NodeAudioProcessor {
       // Transformers.js in Node has no AudioContext, so do not pass a file path.
       // Parse the FFmpeg WAV output into Float32Array and pass samples directly.
       const audio = this._wavBufferToFloat32(wavBuffer);
-      console.log(`Whisper audio input: ${audio.sampleRate}Hz, ${audio.channels}ch, ${audio.samples.length} samples`);
 
       const result = await this.whisperPipeline(audio.samples);
       return result.text || '';

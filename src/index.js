@@ -630,17 +630,7 @@ async function handleClearanceRequest(req, res, data) {
     }
 
     const statusCode = result.code ?? 500
-    const responseLog = {
-        ...result,
-        tokenLength: result.token ? result.token.length : 0,
-        tokenPreview: result.token ? `${result.token.slice(0, 32)}...${result.token.slice(-12)}` : null
-    }
-    if (responseLog.token) responseLog.token = responseLog.tokenPreview
-    if (responseLog.response) responseLog.response = responseLog.tokenPreview
-    if (responseLog.gRecaptchaResponse) responseLog.gRecaptchaResponse = responseLog.tokenPreview
-    if (responseLog['g-recaptcha-response']) responseLog['g-recaptcha-response'] = responseLog.tokenPreview
     console.log(`📤 返回响应: status=${statusCode}, mode=${data.mode}, tokenLength=${result.token ? result.token.length : 0}`)
-    console.log(`📦 返回内容: ${JSON.stringify(responseLog, null, 2)}`)
     if (!res.headersSent) {
         return res.status(statusCode).json(result)
     }
