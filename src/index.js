@@ -263,9 +263,9 @@ async function handleRecaptchaV2Solve(data) {
             type: 'recaptchav2',
             message: 'reCAPTCHA v2 solved successfully',
             token: result.token,
-            response: result.token,
-            gRecaptchaResponse: result.token,
-            'g-recaptcha-response': result.token,
+            response: '同token',
+            gRecaptchaResponse: '同token',
+            'g-recaptcha-response': '同token',
             challengeType: result.challengeType,
             solveTime: result.solveTime
         };
@@ -316,9 +316,9 @@ async function handleRecaptchaV3Solve(data) {
             type: 'recaptchav3',
             message: 'reCAPTCHA v3 solved successfully',
             token: result.token,
-            response: result.token,
-            gRecaptchaResponse: result.token,
-            'g-recaptcha-response': result.token,
+            response: '同token',
+            gRecaptchaResponse: '同token',
+            'g-recaptcha-response': '同token',
             score: result.score,
             solveTime: result.solveTime
         };
