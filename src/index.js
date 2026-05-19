@@ -134,6 +134,13 @@ async function waitForChallengeAndCleanAds(page, options = {}) {
 
 async function cleanAdFrames(page) {
     await page.evaluate(() => {
+        const removedSelectors = ['.fc-message-root', '[class*=\"fc-message-root\"]'];
+        for (const selector of removedSelectors) {
+            for (const el of document.querySelectorAll(selector)) {
+                el.remove();
+            }
+        }
+
         const adPatterns = [
             'google_vignette',
             'googlesyndication',
@@ -143,7 +150,8 @@ async function cleanAdFrames(page) {
             'pagead',
             'ad_iframe',
             'adsbygoogle',
-            'securepubads'
+            'securepubads',
+            'fc-message-root'
         ];
 
         const isAdText = value => {

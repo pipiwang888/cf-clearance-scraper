@@ -46,6 +46,7 @@ class SimpleRecaptchaV2Solver {
       // 1. 等待页面加载
       console.log('⏳ 等待页面完全加载...');
       await this._sleep(3000);
+      await this._removeBlockingAds(page);
 
       // 2. 查找并点击 reCAPTCHA 复选框
       const checkboxClicked = await this._clickCheckbox(page);
@@ -104,7 +105,40 @@ class SimpleRecaptchaV2Solver {
   /**
    * 查找并点击 reCAPTCHA 复选框
    */
+  async _removeBlockingAds(page) {
+    try {
+      const removed = await page.evaluate(() => {
+        const selectors = [
+          '.fc-message-root',
+          '[class*="fc-message-root"]',
+          '[id*="google_vignette"]',
+          '[class*="google_vignette"]'
+        ];
+        let count = 0;
+        for (const selector of selectors) {
+          for (const el of document.querySelectorAll(selector)) {
+            el.remove();
+            count++;
+          }
+        }
+        document.documentElement.style.overflow = 'auto';
+        if (document.body) {
+          document.body.style.overflow = 'auto';
+          document.body.style.pointerEvents = 'auto';
+        }
+        return count;
+      });
+      if (removed > 0) {
+        console.log('🧹 已删除广告弹窗/遮罩: ' + removed + ' 个');
+        await this._sleep(500);
+      }
+    } catch (error) {
+      console.log('⚠️ 清理广告弹窗失败: ' + error.message);
+    }
+  }
+
   async _clickCheckbox(page) {
+    await this._removeBlockingAds(page);
     console.log('🔍 查找 reCAPTCHA 复选框...');
 
     // 等待 reCAPTCHA iframe 加载
@@ -346,6 +380,7 @@ class SimpleRecaptchaV2Solver {
           return frame;
         }
       }
+      await this._removeBlockingAds(page);
       await this._sleep(500);
     }
     
