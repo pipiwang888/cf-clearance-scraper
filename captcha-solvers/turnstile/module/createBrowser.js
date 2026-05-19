@@ -1,4 +1,28 @@
 const { connect } = require("puppeteer-real-browser")
+const fs = require("fs")
+
+function getBrowserExecutablePath() {
+    if (process.env.BROWSER_EXECUTABLE_PATH) return process.env.BROWSER_EXECUTABLE_PATH
+
+    const platformPaths = process.platform === "win32"
+        ? [
+            `${process.env.PROGRAMFILES}\\Google\\Chrome\\Application\\chrome.exe`,
+            `${process.env["PROGRAMFILES(X86)"]}\\Google\\Chrome\\Application\\chrome.exe`,
+            `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`,
+            `${process.env.PROGRAMFILES}\\Microsoft\\Edge\\Application\\msedge.exe`,
+            `${process.env["PROGRAMFILES(X86)"]}\\Microsoft\\Edge\\Application\\msedge.exe`
+        ]
+        : process.platform === "darwin"
+            ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+            : [
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser"
+            ]
+
+    return platformPaths.find(browserPath => browserPath && fs.existsSync(browserPath))
+}
 
 async function createBrowser(options = {}) {
     try {
@@ -184,10 +208,17 @@ async function createBrowser(options = {}) {
             height
         })
 
+        const executablePath = getBrowserExecutablePath()
+
+        if (!executablePath) {
+            console.error("Chrome or Edge executable not found. Set BROWSER_EXECUTABLE_PATH in .env if it is installed in a custom location.")
+            return
+        }
+
         const { browser } = await connect({
             headless: false,
             turnstile: true,
-            executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            executablePath,
             connectOption: { defaultViewport: null },
             disableXvfb: true
         }).catch(e => {

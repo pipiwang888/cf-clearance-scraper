@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 hCaptcha 解决器 - 使用原始 hcaptcha-challenger 库
 只作为中间件，不修改原始代码
@@ -66,7 +66,7 @@ async def solve_hcaptcha(website_url: str, website_key: str, proxy: str = None):
         async with async_playwright() as p:
             # 使用简单的浏览器配置
             launch_options = {
-                "headless": True,
+                "headless": False,
                 "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
             }
             

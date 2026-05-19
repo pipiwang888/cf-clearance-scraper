@@ -5,13 +5,16 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const { spawnSync } = require('child_process');
 const { AudioTranscriptionError } = require('./errors');
 
 class NodeAudioProcessor {
   constructor() {
-    this.tempDir = '/tmp';
+    this.tempDir = os.tmpdir();
     this.supportedFormats = ['mp3', 'wav', 'ogg', 'webm'];
     this.ffmpeg = null;
+    this.ffmpegPath = null;
     this.whisperPipeline = null;
     this.initialized = false;
   }
@@ -58,9 +61,45 @@ class NodeAudioProcessor {
       
       console.log('✅ FFmpeg.js 初始化完成');
     } catch (error) {
-      console.warn('⚠️  FFmpeg.js 初始化失败，回退到系统 FFmpeg');
+      console.warn(`⚠️  FFmpeg.js 初始化失败，回退到系统 FFmpeg: ${error.message}`);
       this.ffmpeg = null;
     }
+
+    if (!this.ffmpeg) {
+      this.ffmpegPath = this._findSystemFFmpeg();
+      if (this.ffmpegPath) {
+        console.log(`✅ 找到系统 FFmpeg: ${this.ffmpegPath}`);
+      } else {
+        console.warn('⚠️  未找到系统 FFmpeg。请安装 ffmpeg，或在 .env 设置 FFMPEG_PATH=C:\\path\\to\\ffmpeg.exe');
+      }
+    }
+  }
+
+  _findSystemFFmpeg() {
+    const candidates = [
+      process.env.FFMPEG_PATH,
+      'ffmpeg',
+      'ffmpeg.exe',
+      path.join(process.cwd(), 'ffmpeg.exe'),
+      path.join(process.cwd(), 'bin', 'ffmpeg.exe'),
+      path.join(__dirname, '..', '..', '..', 'ffmpeg.exe'),
+      path.join(__dirname, '..', '..', '..', 'bin', 'ffmpeg.exe'),
+      'C:\\ffmpeg\\bin\\ffmpeg.exe',
+      'C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe',
+      'C:\\ProgramData\\chocolatey\\bin\\ffmpeg.exe'
+    ].filter(Boolean);
+
+    for (const candidate of candidates) {
+      try {
+        const result = spawnSync(candidate, ['-version'], { encoding: 'utf8', timeout: 5000 });
+        if (result.status === 0 || (result.stdout && result.stdout.includes('ffmpeg version'))) {
+          return candidate;
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+    return null;
   }
 
   /**
@@ -68,20 +107,35 @@ class NodeAudioProcessor {
    */
   async _initializeWhisper() {
     try {
-      const { pipeline } = require('@xenova/transformers');
+      const { pipeline, env } = require('@xenova/transformers');
+      const cacheDir = process.env.TRANSFORMERS_CACHE || path.join(process.cwd(), '.cache', 'transformers');
+      const remoteHost = process.env.HF_ENDPOINT || process.env.TRANSFORMERS_REMOTE_HOST || 'https://huggingface.co';
+      const whisperModel = process.env.WHISPER_MODEL || 'Xenova/whisper-tiny.en';
+
+      env.cacheDir = cacheDir;
+      env.allowLocalModels = true;
+      env.allowRemoteModels = true;
+      if (env.backends?.onnx?.wasm) {
+        env.backends.onnx.wasm.numThreads = Number(process.env.WHISPER_WASM_THREADS) || 1;
+      }
+      if (remoteHost && remoteHost !== 'https://huggingface.co') {
+        env.remoteHost = remoteHost;
+      }
       
-      console.log('📥 加载 Whisper 模型（首次运行可能需要几分钟下载）...');
+      console.log(`📥 加载 Whisper 模型 ${whisperModel}（首次运行可能需要几分钟下载）...`);
+      console.log(`📦 Transformers cache: ${cacheDir}`);
+      console.log(`🌐 Transformers remote host: ${env.remoteHost || 'https://huggingface.co'}`);
       
       // 使用较小的 Whisper 模型以节省内存和提高速度
       this.whisperPipeline = await pipeline(
         'automatic-speech-recognition',
-        'Xenova/whisper-tiny.en', // 英文专用小模型
+        whisperModel, // 英文专用小模型
         { revision: 'main' }
       );
       
       console.log('✅ Whisper 模型加载完成');
     } catch (error) {
-      console.warn('⚠️  Whisper 模型加载失败，将使用备用识别方案');
+      console.warn(`⚠️  Whisper 模型加载失败: ${error.stack || error.message}`);
       this.whisperPipeline = null;
     }
   }
@@ -92,17 +146,19 @@ class NodeAudioProcessor {
   async downloadAudio(page, audioUrl) {
     try {
       console.log(`🎵 开始下载音频: ${audioUrl}`);
-      
-      const response = await page.evaluate(async (url) => {
-        const response = await fetch(url);
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-        const arrayBuffer = await response.arrayBuffer();
-        return Array.from(new Uint8Array(arrayBuffer));
-      }, audioUrl);
 
-      const audioBuffer = Buffer.from(response);
+      // 不在页面上下文 fetch，避免跨域/CSP 导致 Failed to fetch；
+      // 但要复用当前浏览器会话的 UA/Cookie/Referer，否则 recaptcha.net 可能返回 503。
+      const axios = require('axios');
+      const sessionHeaders = await this._buildBrowserSessionHeaders(page, audioUrl);
+      const response = await axios.get(audioUrl, {
+        responseType: 'arraybuffer',
+        timeout: 30000,
+        headers: sessionHeaders,
+        validateStatus: status => status >= 200 && status < 300
+      });
+
+      const audioBuffer = Buffer.from(response.data);
       console.log(`✅ 音频下载完成，大小: ${audioBuffer.length} bytes`);
       
       return audioBuffer;
@@ -110,6 +166,66 @@ class NodeAudioProcessor {
       console.error('音频下载失败:', error);
       throw new AudioTranscriptionError(`Failed to download audio: ${error.message}`);
     }
+  }
+
+  /**
+   * 构造接近浏览器真实请求的音频下载 headers。
+   * reCAPTCHA audio URL 绑定 challenge 会话，裸 axios 缺少 Cookie/Referer 时容易 503。
+   */
+  async _buildBrowserSessionHeaders(page, audioUrl) {
+    const audioOrigin = new URL(audioUrl).origin;
+    let userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36';
+    let referer = audioOrigin + '/';
+    let cookieHeader = '';
+
+    try {
+      userAgent = await page.browser().userAgent();
+    } catch (e) {
+      try {
+        userAgent = await page.evaluate(() => navigator.userAgent);
+      } catch (_) {}
+    }
+
+    try {
+      const frames = page.frames();
+      const bframe = frames.find(frame => {
+        const url = frame.url();
+        return url.includes('recaptcha') && (url.includes('/bframe') || url.includes('bframe'));
+      });
+      if (bframe) {
+        referer = bframe.url();
+      } else if (page.url && page.url()) {
+        referer = page.url();
+      }
+    } catch (e) {}
+
+    try {
+      const cookies = await page.cookies(audioUrl);
+      cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    } catch (e) {
+      try {
+        const cookies = await page.cookies();
+        cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+      } catch (_) {}
+    }
+
+    const headers = {
+      'User-Agent': userAgent,
+      'Accept': 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8',
+      'Accept-Language': process.env.RECAPTCHA_ACCEPT_LANGUAGE || 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Referer': referer,
+      'Origin': audioOrigin,
+      'Sec-Fetch-Site': 'same-origin',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Dest': 'empty'
+    };
+
+    if (cookieHeader) {
+      headers.Cookie = cookieHeader;
+    }
+
+    console.log(`🔐 使用浏览器会话下载音频: cookie=${cookieHeader ? 'yes' : 'no'}, referer=${referer}`);
+    return headers;
   }
 
   /**
@@ -189,7 +305,13 @@ class NodeAudioProcessor {
         fs.writeFileSync(inputPath, audioBuffer);
 
         // FFmpeg 转换命令
-        const ffmpeg = spawn('ffmpeg', [
+      const ffmpegPath = this.ffmpegPath || this._findSystemFFmpeg();
+      if (!ffmpegPath) {
+        reject(new AudioTranscriptionError('FFmpeg not found. Install ffmpeg or set FFMPEG_PATH in .env'));
+        return;
+      }
+
+      const ffmpeg = spawn(ffmpegPath, [
           '-i', inputPath,
           '-ar', '16000',
           '-ac', '1',
@@ -252,14 +374,20 @@ class NodeAudioProcessor {
         }
       }
 
-      // 回退到模拟识别
+      if (process.env.RECAPTCHA_DISABLE_MOCK_TRANSCRIPTION === 'true') {
+        throw new AudioTranscriptionError('Whisper unavailable and mock transcription is disabled');
+      }
+
       console.log('⚠️  Whisper 不可用，使用模拟识别结果');
       return await this._transcribeWithMockRecognition(wavBuffer, language);
 
     } catch (error) {
       console.error('语音识别失败:', error);
       
-      // 回退到模拟识别
+      if (process.env.RECAPTCHA_DISABLE_MOCK_TRANSCRIPTION === 'true') {
+        throw new AudioTranscriptionError(`Whisper transcription failed and mock transcription is disabled: ${error.message}`);
+      }
+
       try {
         return await this._transcribeWithMockRecognition(wavBuffer, language);
       } catch (fallbackError) {
@@ -273,30 +401,72 @@ class NodeAudioProcessor {
    */
   async _transcribeWithWhisper(wavBuffer) {
     try {
-      // 将 WAV buffer 转换为 Whisper 可以处理的格式
-      const timestamp = Date.now();
-      const tempAudioPath = path.join(this.tempDir, `whisper_${timestamp}.wav`);
-      
-      // 写入临时文件
-      fs.writeFileSync(tempAudioPath, wavBuffer);
-      
-      try {
-        // Whisper 转录
-        const result = await this.whisperPipeline(tempAudioPath);
-        
-        // 清理临时文件
-        fs.unlinkSync(tempAudioPath);
-        
-        return result.text || '';
-      } catch (error) {
-        // 清理临时文件
-        try { fs.unlinkSync(tempAudioPath); } catch (e) {}
-        throw error;
-      }
+      // Transformers.js in Node has no AudioContext, so do not pass a file path.
+      // Parse the FFmpeg WAV output into Float32Array and pass samples directly.
+      const audio = this._wavBufferToFloat32(wavBuffer);
+      console.log(`Whisper audio input: ${audio.sampleRate}Hz, ${audio.channels}ch, ${audio.samples.length} samples`);
+
+      const result = await this.whisperPipeline(audio.samples);
+      return result.text || '';
     } catch (error) {
-      console.warn('Whisper 转录失败:', error.message);
+      console.warn('Whisper transcription failed:', error.message);
       return '';
     }
+  }
+
+  _wavBufferToFloat32(wavBuffer) {
+    const riff = wavBuffer.toString('ascii', 0, 4);
+    const wave = wavBuffer.toString('ascii', 8, 12);
+    if (riff !== 'RIFF' || wave !== 'WAVE') {
+      throw new AudioTranscriptionError('Invalid WAV buffer');
+    }
+
+    let offset = 12;
+    let fmt = null;
+    let dataOffset = -1;
+    let dataSize = 0;
+
+    while (offset + 8 <= wavBuffer.length) {
+      const chunkId = wavBuffer.toString('ascii', offset, offset + 4);
+      const chunkSize = wavBuffer.readUInt32LE(offset + 4);
+      const chunkData = offset + 8;
+
+      if (chunkId === 'fmt ') {
+        fmt = {
+          audioFormat: wavBuffer.readUInt16LE(chunkData),
+          channels: wavBuffer.readUInt16LE(chunkData + 2),
+          sampleRate: wavBuffer.readUInt32LE(chunkData + 4),
+          bitsPerSample: wavBuffer.readUInt16LE(chunkData + 14)
+        };
+      } else if (chunkId === 'data') {
+        dataOffset = chunkData;
+        dataSize = chunkSize;
+        break;
+      }
+
+      offset = chunkData + chunkSize + (chunkSize % 2);
+    }
+
+    if (!fmt || dataOffset < 0 || dataSize <= 0) {
+      throw new AudioTranscriptionError('Invalid WAV chunks');
+    }
+    if (fmt.audioFormat !== 1 || fmt.bitsPerSample !== 16) {
+      throw new AudioTranscriptionError(`Unsupported WAV format: format=${fmt.audioFormat}, bits=${fmt.bitsPerSample}`);
+    }
+
+    const frameCount = Math.floor(dataSize / (fmt.bitsPerSample / 8) / fmt.channels);
+    const samples = new Float32Array(frameCount);
+
+    for (let i = 0; i < frameCount; i++) {
+      let sum = 0;
+      for (let ch = 0; ch < fmt.channels; ch++) {
+        const sampleOffset = dataOffset + (i * fmt.channels + ch) * 2;
+        sum += wavBuffer.readInt16LE(sampleOffset) / 32768;
+      }
+      samples[i] = sum / fmt.channels;
+    }
+
+    return { samples, sampleRate: fmt.sampleRate, channels: fmt.channels };
   }
 
   /**

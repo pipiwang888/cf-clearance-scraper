@@ -11,11 +11,83 @@ class RecaptchaV3Solver {
     this.maxWaitTime = 30000; // 最大等待时间
   }
 
+  async _cleanAdFrames(page) {
+    try {
+      await page.evaluate(() => {
+        const adPatterns = [
+          'google_vignette',
+          'googlesyndication',
+          'googleads',
+          'doubleclick',
+          'adservice.google',
+          'pagead',
+          'ad_iframe',
+          'adsbygoogle',
+          'securepubads'
+        ];
+        const isAdText = value => {
+          const text = String(value || '').toLowerCase();
+          return adPatterns.some(pattern => text.includes(pattern)) ||
+            text.includes('advertisement') ||
+            text.includes('google-auto-placed');
+        };
+        for (const iframe of document.querySelectorAll('iframe')) {
+          if (isAdText(iframe.src) || isAdText(`${iframe.id || ''} ${iframe.className || ''}`)) {
+            iframe.remove();
+          }
+        }
+        for (const el of document.querySelectorAll('[id], [class], ins.adsbygoogle')) {
+          if (isAdText(`${el.id || ''} ${el.className || ''}`)) {
+            el.remove();
+          }
+        }
+        document.documentElement.style.overflow = 'auto';
+        if (document.body) document.body.style.overflow = 'auto';
+      });
+    } catch (e) {}
+  }
+
+  async _waitForPageReady(page, timeout = 120000) {
+    const started = Date.now();
+    let lastState = null;
+
+    while (Date.now() - started < timeout) {
+      await this._cleanAdFrames(page);
+      lastState = await page.evaluate(() => {
+        const html = document.documentElement.innerHTML;
+        const title = document.title || '';
+        const frames = [...document.querySelectorAll('iframe')].map(f => f.src || '');
+        const hasCf = title.includes('Just a moment') ||
+          html.includes('cf_chl') ||
+          html.includes('cf_chl_opt') ||
+          html.includes('challenges.cloudflare.com') ||
+          frames.some(src => src.includes('challenges.cloudflare.com'));
+        const hasRecaptcha = html.includes('google.com/recaptcha') ||
+          html.includes('recaptcha.net/recaptcha') ||
+          html.includes('g-recaptcha') ||
+          html.includes('grecaptcha') ||
+          frames.some(src => src.includes('google.com/recaptcha') || src.includes('recaptcha.net/recaptcha'));
+        return { title, url: location.href, hasCf, hasRecaptcha, frameCount: frames.length };
+      }).catch(error => ({ title: '', url: '', hasCf: true, hasRecaptcha: false, frameCount: 0, error: error.message }));
+
+      if (!lastState.hasCf) {
+        console.log(`✅ 页面已通过前置验证: recaptcha=${lastState.hasRecaptcha}, frames=${lastState.frameCount}`);
+        return lastState;
+      }
+
+      console.log(`⏳ 等待 Cloudflare/广告结束: cf=${lastState.hasCf}, recaptcha=${lastState.hasRecaptcha}, title="${lastState.title}"`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+
+    throw new Error(`等待 Cloudflare/广告结束超时: ${JSON.stringify(lastState)}`);
+  }
+
   /**
    * 解决 reCAPTCHA v3 验证码
    */
   async solve(page, options = {}) {
     const {
+      url = null,
       action = 'submit',
       timeout = this.maxWaitTime,
       sitekey = null
@@ -69,7 +141,13 @@ class RecaptchaV3Solver {
     page.on('response', responseHandler);
 
     try {
-      // 2. 等待页面加载并注入 Web3 环境
+      // 2. 可选导航。response 监听器已注册，避免错过 reCAPTCHA reload 响应。
+      if (url) {
+        console.log(`🔗 导航到: ${url}`);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.min(timeout, 45000) });
+        await this._waitForPageReady(page, Math.max(timeout, 120000));
+      }
+
       console.log('⏳ 等待页面加载...');
       await new Promise(resolve => setTimeout(resolve, 2000));
       
@@ -78,6 +156,7 @@ class RecaptchaV3Solver {
       await this._injectWeb3Environment(page);
       
       // 3. 尝试等待 reCAPTCHA v3 脚本加载
+      await this._ensureRecaptchaScript(page, sitekey);
       await this._waitForRecaptchaLoad(page, Math.min(timeout, 15000));
 
       // 4. 首先尝试直接执行 reCAPTCHA v3
@@ -148,6 +227,38 @@ class RecaptchaV3Solver {
     } catch (error) {
       console.log('⚠️  reCAPTCHA v3 脚本未在预期时间内加载，继续尝试...');
       // 不抛出错误，继续执行
+    }
+  }
+
+  /**
+   * 如果页面没有主动加载 reCAPTCHA v3 脚本，则按传入 sitekey 注入官方 api.js。
+   */
+  async _ensureRecaptchaScript(page, sitekey) {
+    if (!sitekey) return;
+
+    try {
+      const state = await page.evaluate((sitekey) => {
+        const hasRecaptcha =
+          Boolean(window.grecaptcha) ||
+          [...document.scripts].some((s) => s.src && s.src.includes('google.com/recaptcha'));
+
+        if (hasRecaptcha) {
+          return { injected: false, reason: 'already_present' };
+        }
+
+        const script = document.createElement('script');
+        script.src = `https://www.google.com/recaptcha/api.js?render=${encodeURIComponent(sitekey)}`;
+        script.async = true;
+        script.defer = true;
+        document.head.appendChild(script);
+        return { injected: true };
+      }, sitekey);
+
+      if (state.injected) {
+        console.log('✅ 已注入 reCAPTCHA v3 api.js');
+      }
+    } catch (error) {
+      console.warn('⚠️  注入 reCAPTCHA 脚本失败:', error.message);
     }
   }
 

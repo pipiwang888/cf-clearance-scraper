@@ -5,12 +5,13 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawn } = require('child_process');
 const { AudioTranscriptionError } = require('./errors');
 
 class SpeechRecognition {
   constructor() {
-    this.tempDir = '/tmp';
+    this.tempDir = os.tmpdir();
     this.pythonScriptPath = path.join(__dirname, 'speech_recognizer.py');
   }
 

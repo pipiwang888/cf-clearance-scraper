@@ -77,8 +77,103 @@ const solveTurnstileMax = require('../captcha-solvers/turnstile/endpoints/solveT
 const wafSession = require('../captcha-solvers/turnstile/endpoints/wafSession')
 const getCfClearance = require('../captcha-solvers/turnstile/endpoints/cfcookieService')
 const { solveHcaptcha } = require('./endpoints/captcha')
-const PythonRecaptchaSolver = require('../captcha-solvers/recaptcha/python-recaptcha-solver')
+const SimpleRecaptchaV2Solver = require('../captcha-solvers/recaptcha/simple-recaptcha-v2')
 const RecaptchaV3Solver = require('../captcha-solvers/recaptcha/recaptchav3/index')
+
+async function waitForChallengeAndCleanAds(page, options = {}) {
+    const timeout = options.timeout || Number(process.env.RECAPTCHA_PAGE_READY_TIMEOUT) || 120000;
+    const requireRecaptcha = options.requireRecaptcha !== false;
+    const started = Date.now();
+    let lastState = null;
+
+    while (Date.now() - started < timeout) {
+        await cleanAdFrames(page).catch(() => {});
+
+        lastState = await page.evaluate(() => {
+            const html = document.documentElement.innerHTML;
+            const title = document.title || '';
+            const frames = [...document.querySelectorAll('iframe')].map(f => f.src || '');
+            const hasCf = title.includes('Just a moment') ||
+                html.includes('cf_chl') ||
+                html.includes('cf_chl_opt') ||
+                html.includes('challenges.cloudflare.com') ||
+                frames.some(src => src.includes('challenges.cloudflare.com'));
+            const hasRecaptcha = html.includes('google.com/recaptcha') ||
+                html.includes('recaptcha.net/recaptcha') ||
+                html.includes('g-recaptcha') ||
+                html.includes('grecaptcha') ||
+                frames.some(src => src.includes('google.com/recaptcha') || src.includes('recaptcha.net/recaptcha'));
+
+            return {
+                title,
+                url: location.href,
+                hasCf,
+                hasRecaptcha,
+                frameCount: frames.length
+            };
+        }).catch(error => ({
+            title: '',
+            url: '',
+            hasCf: true,
+            hasRecaptcha: false,
+            frameCount: 0,
+            error: error.message
+        }));
+
+        if (!lastState.hasCf && (!requireRecaptcha || lastState.hasRecaptcha)) {
+            console.log(`✅ 页面已就绪: recaptcha=${lastState.hasRecaptcha}, frames=${lastState.frameCount}`);
+            return lastState;
+        }
+
+        console.log(`⏳ 等待页面验证/广告结束: cf=${lastState.hasCf}, recaptcha=${lastState.hasRecaptcha}, title="${lastState.title}"`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+
+    throw new Error(`等待 Cloudflare/广告结束并加载 reCAPTCHA 超时: ${JSON.stringify(lastState)}`);
+}
+
+async function cleanAdFrames(page) {
+    await page.evaluate(() => {
+        const adPatterns = [
+            'google_vignette',
+            'googlesyndication',
+            'googleads',
+            'doubleclick',
+            'adservice.google',
+            'pagead',
+            'ad_iframe',
+            'adsbygoogle',
+            'securepubads'
+        ];
+
+        const isAdText = value => {
+            const text = String(value || '').toLowerCase();
+            return adPatterns.some(pattern => text.includes(pattern)) ||
+                text.includes('advertisement') ||
+                text.includes('google-auto-placed');
+        };
+
+        for (const iframe of document.querySelectorAll('iframe')) {
+            const src = iframe.src || '';
+            const idClass = `${iframe.id || ''} ${iframe.className || ''}`;
+            if (isAdText(src) || isAdText(idClass)) {
+                iframe.remove();
+            }
+        }
+
+        for (const el of document.querySelectorAll('[id], [class], ins.adsbygoogle')) {
+            const idClass = `${el.id || ''} ${el.className || ''}`;
+            if (isAdText(idClass)) {
+                el.remove();
+            }
+        }
+
+        document.documentElement.style.overflow = 'auto';
+        if (document.body) {
+            document.body.style.overflow = 'auto';
+        }
+    });
+}
 
 
 // 统一验证码处理接口 - 根路径
@@ -127,42 +222,57 @@ app.post('/', async (req, res) => {
     }
 })
 
-// 处理 reCAPTCHA v2 求解 (使用 Python 实现)
+// 处理 reCAPTCHA v2 求解
 async function handleRecaptchaV2Solve(data) {
+    let context = null;
     try {
-        console.log('🐍 使用 Python reCAPTCHA v2 解决器...');
-        console.log('💡 Python 脚本将独立处理浏览器操作，不会创建重复页面');
-        
-        // 创建 Python reCAPTCHA v2 解决器
-        const solver = new PythonRecaptchaSolver();
-        
-        // 环境验证
-        const envCheck = await solver.validateEnvironment();
-        if (!envCheck.valid) {
-            console.warn('⚠️  Python 环境检查警告:', envCheck.issues);
-            // 尝试自动安装依赖
-            try {
-                await solver.installDependencies();
-            } catch (installError) {
-                console.error('❌ 自动安装 Python 依赖失败:', installError.message);
-            }
+        console.log('🤖 使用内置 JS reCAPTCHA v2 解决器...');
+
+        if (!global.contextPool) {
+            throw new Error('Browser context pool is not ready');
         }
-        
-        // Python 脚本完全独立处理：创建浏览器、导航、解决验证码、获取token
-        const result = await solver.solveDirectly({
-            url: data.url,
-            language: data.language || 'en',
-            proxy: data.proxy,
-            headless: false, // 显示 Python 的浏览器，便于调试
-            timeout: 180000
+
+        context = await global.contextPool.getContext();
+        if (!context) {
+            throw new Error('Failed to acquire browser context');
+        }
+
+        const page = await context.newPage();
+        console.log(`🔗 导航到: ${data.url}`);
+        await page.goto(data.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await waitForChallengeAndCleanAds(page, { timeout: Number(process.env.RECAPTCHA_PAGE_READY_TIMEOUT) || 120000 });
+
+        const solver = new SimpleRecaptchaV2Solver();
+        const result = await solver.solve(page, {
+            language: data.language || 'en-US',
+            timeout: Number(process.env.RECAPTCHA_TIMEOUT) || 180000
         });
-        
-        console.log('✅ Python reCAPTCHA v2 解决成功');
-        return { token: result.token, code: 200, challengeType: result.challengeType, solveTime: result.solveTime };
+
+        console.log('✅ reCAPTCHA v2 解决成功');
+        return {
+            code: 200,
+            success: true,
+            type: 'recaptchav2',
+            message: 'reCAPTCHA v2 solved successfully',
+            token: result.token,
+            response: result.token,
+            gRecaptchaResponse: result.token,
+            'g-recaptcha-response': result.token,
+            challengeType: result.challengeType,
+            solveTime: result.solveTime
+        };
         
     } catch (error) {
-        console.error('❌ Python reCAPTCHA v2 解决失败:', error.message);
+        console.error('❌ reCAPTCHA v2 解决失败:', error.message);
         throw error;
+    } finally {
+        if (context && global.contextPool) {
+            try {
+                await global.contextPool.releaseContext(context);
+            } catch (e) {
+                console.warn('释放浏览器上下文时出现警告:', e.message);
+            }
+        }
     }
 }
 
@@ -180,22 +290,30 @@ async function handleRecaptchaV3Solve(data) {
             console.log(`🌐 使用代理: ${data.proxy}`);
         }
         
-        // 创建 reCAPTCHA v3 解决器并在导航前初始化
+        // 创建 reCAPTCHA v3 解决器。监听器必须在导航前注册，否则可能错过 reload 响应。
         const solver = new RecaptchaV3Solver();
-        
-        // 导航到目标页面
-        console.log(`🔗 导航到: ${data.url}`);
-        await page.goto(data.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        
+
         // 解决 reCAPTCHA v3
         const result = await solver.solve(page, {
+            url: data.url,
             action: data.action || 'submit',
             sitekey: data.siteKey,
-            timeout: 30000
+            timeout: Number(process.env.RECAPTCHA_TIMEOUT) || 90000
         });
         
         console.log('✅ reCAPTCHA v3 解决成功');
-        return { token: result.token, code: 200, score: result.score, solveTime: result.solveTime };
+        return {
+            code: 200,
+            success: true,
+            type: 'recaptchav3',
+            message: 'reCAPTCHA v3 solved successfully',
+            token: result.token,
+            response: result.token,
+            gRecaptchaResponse: result.token,
+            'g-recaptcha-response': result.token,
+            score: result.score,
+            solveTime: result.solveTime
+        };
         
     } catch (error) {
         console.error('❌ reCAPTCHA v3 解决失败:', error.message);
@@ -503,7 +621,21 @@ async function handleClearanceRequest(req, res, data) {
         console.log('⚠️  High memory usage after request completion')
     }
 
-    res.status(result.code ?? 500).send(result)
+    const statusCode = result.code ?? 500
+    const responseLog = {
+        ...result,
+        tokenLength: result.token ? result.token.length : 0,
+        tokenPreview: result.token ? `${result.token.slice(0, 32)}...${result.token.slice(-12)}` : null
+    }
+    if (responseLog.token) responseLog.token = responseLog.tokenPreview
+    if (responseLog.response) responseLog.response = responseLog.tokenPreview
+    if (responseLog.gRecaptchaResponse) responseLog.gRecaptchaResponse = responseLog.tokenPreview
+    if (responseLog['g-recaptcha-response']) responseLog['g-recaptcha-response'] = responseLog.tokenPreview
+    console.log(`📤 返回响应: status=${statusCode}, mode=${data.mode}, tokenLength=${result.token ? result.token.length : 0}`)
+    console.log(`📦 返回内容: ${JSON.stringify(responseLog, null, 2)}`)
+    if (!res.headersSent) {
+        return res.status(statusCode).json(result)
+    }
 }
 
 // 监控API端点  

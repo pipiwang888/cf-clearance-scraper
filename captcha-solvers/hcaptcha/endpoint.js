@@ -167,9 +167,9 @@ function callHcaptchaSolver(params) {
         console.log(`📁 解决器路径: ${solverPath}`);
         console.log(`📄 参数JSON: ${paramsJson}`);
 
-        // 启动 Python 子进程，重定向stderr到/dev/null
+        // 启动 Python 子进程，重定向stderr到平台对应的空设备
         console.log(`🚀 启动Python进程: ${new Date().toISOString()}`);
-        const devNull = fs.openSync('/dev/null', 'w');
+        const devNull = fs.openSync(process.platform === 'win32' ? 'NUL' : '/dev/null', 'w');
         
         const pythonProcess = spawn(pythonCommand, [solverPath, paramsJson], {
             stdio: ['pipe', 'pipe', devNull], // 重定向stderr到/dev/null
@@ -177,6 +177,7 @@ function callHcaptchaSolver(params) {
             env: { 
                 ...process.env, 
                 LOG_LEVEL: 'CRITICAL',
+                PYTHONIOENCODING: 'utf-8',
                 PYTHONUNBUFFERED: '1'  // 确保Python输出不被缓冲
             }
         });
