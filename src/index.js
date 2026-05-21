@@ -231,18 +231,60 @@ app.post('/', async (req, res) => {
 })
 
 // 处理 reCAPTCHA v2 求解
+function getRecaptchaBrowserExecutablePath() {
+    if (process.env.BROWSER_EXECUTABLE_PATH) return process.env.BROWSER_EXECUTABLE_PATH
+
+    const platformPaths = process.platform === "win32"
+        ? [
+            (process.env.PROGRAMFILES || '') + '\\Google\\Chrome\\Application\\chrome.exe',
+            (process.env["PROGRAMFILES(X86)"] || '') + '\\Google\\Chrome\\Application\\chrome.exe',
+            (process.env.LOCALAPPDATA || '') + '\\Google\\Chrome\\Application\\chrome.exe',
+            (process.env.PROGRAMFILES || '') + '\\Microsoft\\Edge\\Application\\msedge.exe',
+            (process.env["PROGRAMFILES(X86)"] || '') + '\\Microsoft\\Edge\\Application\\msedge.exe'
+        ]
+        : process.platform === "darwin"
+            ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+            : ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
+
+    return platformPaths.find(browserPath => browserPath && fs.existsSync(browserPath))
+}
+
+function normalizeProxyConfig(proxy) {
+    if (!proxy) return null
+    if (typeof proxy === 'string') {
+        try {
+            const parsed = new URL(proxy)
+            return { host: parsed.hostname, port: parsed.port, username: parsed.username ? decodeURIComponent(parsed.username) : undefined, password: parsed.password ? decodeURIComponent(parsed.password) : undefined }
+        } catch (e) { return null }
+    }
+    if (!proxy.host || !proxy.port) return null
+    return { host: String(proxy.host).replace(/^https?:\/\//i, '').replace(/^socks5?:\/\//i, ''), port: String(proxy.port), username: proxy.username, password: proxy.password }
+}
+
+async function createProxiedRecaptchaBrowser(proxy) {
+    const proxyConfig = normalizeProxyConfig(proxy)
+    if (!proxyConfig || !proxyConfig.host || !proxyConfig.port) throw new Error('Invalid proxy config: expected { host, port, username?, password? }')
+    const executablePath = getRecaptchaBrowserExecutablePath()
+    const { browser } = await connectRealBrowser({ headless: false, turnstile: false, proxy: proxyConfig, customConfig: executablePath ? { chromePath: executablePath } : {}, connectOption: { defaultViewport: null }, disableXvfb: true })
+    if (!browser) throw new Error('Failed to launch proxied browser')
+    return browser
+}
 async function handleRecaptchaV2Solve(data) {
     let context = null;
+    let proxyBrowser = null;
+    const useProxyBrowser = !!data.proxy;
     try {
         console.log('🤖 使用内置 JS reCAPTCHA v2 解决器...');
 
-        if (!global.contextPool) {
-            throw new Error('Browser context pool is not ready');
-        }
-
-        context = await global.contextPool.getContext();
-        if (!context) {
-            throw new Error('Failed to acquire browser context');
+        if (useProxyBrowser) {
+            const proxyConfig = normalizeProxyConfig(data.proxy);
+            console.log(`🌐 reCAPTCHA v2 使用独立代理浏览器: ${proxyConfig.host}:${proxyConfig.port}`);
+            proxyBrowser = await createProxiedRecaptchaBrowser(data.proxy);
+            context = await proxyBrowser.createBrowserContext({ ignoreHTTPSErrors: true });
+        } else {
+            if (!global.contextPool) throw new Error('Browser context pool is not ready');
+            context = await global.contextPool.getContext();
+            if (!context) throw new Error('Failed to acquire browser context');
         }
 
         const page = await context.newPage();
@@ -274,18 +316,18 @@ async function handleRecaptchaV2Solve(data) {
         console.error('❌ reCAPTCHA v2 解决失败:', error.message);
         throw error;
     } finally {
-        if (context && global.contextPool) {
-            try {
-                await global.contextPool.releaseContext(context);
-            } catch (e) {
-                console.warn('释放浏览器上下文时出现警告:', e.message);
+        if (useProxyBrowser) {
+            if (context) {
+                try { await context.close(); } catch (e) { console.warn('关闭代理上下文时出现警告:', e.message); }
             }
+            if (proxyBrowser) {
+                try { await proxyBrowser.close(); } catch (e) { console.warn('关闭代理浏览器时出现警告:', e.message); }
+            }
+        } else if (context && global.contextPool) {
+            try { await global.contextPool.releaseContext(context); } catch (e) { console.warn('释放浏览器上下文时出现警告:', e.message); }
         }
     }
 }
-
-
-// 处理 reCAPTCHA v3 求解
 async function handleRecaptchaV3Solve(data) {
     let context = null;
     try {
