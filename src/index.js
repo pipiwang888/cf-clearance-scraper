@@ -295,7 +295,10 @@ async function handleRecaptchaV2Solve(data) {
         const solver = new SimpleRecaptchaV2Solver();
         const result = await solver.solve(page, {
             language: data.language || 'en-US',
-            timeout: Number(process.env.RECAPTCHA_TIMEOUT) || 180000
+            timeout: Number(process.env.RECAPTCHA_TIMEOUT) || 180000,
+            method: data.method || 'audio',
+            invisible: data.invisible === true || data.method === 'invisible',
+            siteKey: data.siteKey || data.websiteKey
         });
 
         console.log('✅ reCAPTCHA v2 解决成功');

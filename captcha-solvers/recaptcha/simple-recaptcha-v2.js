@@ -37,7 +37,7 @@ class SimpleRecaptchaV2Solver {
    * 解决 reCAPTCHA v2 - 简化流程
    */
   async solve(page, options = {}) {
-    const { language = 'en-US', timeout = 120000 } = options;
+    const { language = 'en-US', timeout = 120000, method = 'audio', siteKey = null, invisible = false } = options;
     const startTime = Date.now();
 
     console.log('🤖 开始简化的 reCAPTCHA v2 解决流程...');
@@ -49,6 +49,11 @@ class SimpleRecaptchaV2Solver {
       await this._removeBlockingAds(page);
 
       // 2. 查找并点击 reCAPTCHA 复选框
+      if (method === 'invisible' || invisible) {
+        console.log('Starting reCAPTCHA v2 invisible mode...');
+        const token = await this._solveInvisible(page, { siteKey, timeout, language, startTime });
+        return { success: true, token, challengeType: 'invisible', solveTime: Date.now() - startTime };
+      }
       const checkboxClicked = await this._clickCheckbox(page);
       if (!checkboxClicked) {
         throw new RecaptchaNotFoundError('无法找到或点击 reCAPTCHA 复选框');
@@ -137,6 +142,117 @@ class SimpleRecaptchaV2Solver {
     }
   }
 
+  async _waitForToken(page, timeout = 15000) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const token = await this._getToken(page, { quiet: true });
+      if (token) return token;
+      await this._sleep(500);
+    }
+    return null;
+  }
+
+  async _findRecaptchaWidgetIds(page) {
+    try {
+      return await page.evaluate(() => {
+        const ids = new Set();
+        const cfg = window.___grecaptcha_cfg;
+        const seen = new Set();
+        function scan(value) {
+          if (!value || typeof value !== 'object' || seen.has(value)) return;
+          seen.add(value);
+          if (value.id !== undefined && (value.sitekey || value.siteKey || value.size || value.callback)) ids.add(String(value.id));
+          for (const [key, child] of Object.entries(value)) {
+            if (/^\d+$/.test(key) && child && typeof child === 'object') ids.add(String(key));
+            scan(child);
+          }
+        }
+        if (cfg && cfg.clients) scan(cfg.clients);
+        for (const el of document.querySelectorAll('.g-recaptcha, [data-sitekey]')) {
+          const id = el.getAttribute('data-widget-id') || el.getAttribute('data-widgetid');
+          if (id !== null && id !== '') ids.add(String(id));
+        }
+        return [...ids].filter((id) => /^\d+$/.test(id));
+      });
+    } catch (e) { return []; }
+  }
+
+  async _ensureInvisibleWidget(page, siteKey) {
+    if (!siteKey) return false;
+    try {
+      return await page.evaluate(async ({ siteKey }) => {
+        if (!window.grecaptcha || typeof window.grecaptcha.render !== 'function') return false;
+        let container = document.querySelector('#codex-recaptcha-v2-invisible');
+        if (!container) {
+          container = document.createElement('div');
+          container.id = 'codex-recaptcha-v2-invisible';
+          container.style.cssText = 'position:absolute;left:0;top:0;width:1px;height:1px;z-index:2147483647;';
+          document.body.appendChild(container);
+        }
+        if (!container.getAttribute('data-widget-id')) {
+          const id = window.grecaptcha.render(container, { sitekey: siteKey, size: 'invisible' });
+          container.setAttribute('data-widget-id', String(id));
+        }
+        return true;
+      }, { siteKey });
+    } catch (e) { return false; }
+  }
+
+  async _executeInvisible(page, siteKey) {
+    await this._removeBlockingAds(page);
+    await page.waitForSelector('iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net/recaptcha"], .g-recaptcha, [data-sitekey]', { timeout: 30000 }).catch(() => null);
+    await this._ensureInvisibleWidget(page, siteKey);
+    const widgetIds = await this._findRecaptchaWidgetIds(page);
+    console.log('Invisible widget ids: ' + (widgetIds.length ? widgetIds.join(',') : 'none'));
+    return await page.evaluate(async ({ widgetIds, siteKey }) => {
+      if (!window.grecaptcha || typeof window.grecaptcha.execute !== 'function') return { executed: false, error: 'grecaptcha.execute not available' };
+      const calls = [];
+      for (const id of widgetIds) calls.push(Number(id));
+      calls.push(undefined);
+      let lastError = null;
+      for (const id of calls) {
+        try {
+          let result = id === undefined ? window.grecaptcha.execute() : window.grecaptcha.execute(id);
+          if (result && typeof result.then === 'function') {
+            const token = await Promise.race([result, new Promise((resolve) => setTimeout(() => resolve(null), 10000))]);
+            if (token) return { executed: true, token, widgetId: id };
+          }
+          return { executed: true, widgetId: id };
+        } catch (e) { lastError = e && e.message ? e.message : String(e); }
+      }
+      if (siteKey) {
+        try {
+          const result = window.grecaptcha.execute(siteKey, {});
+          if (result && typeof result.then === 'function') {
+            const token = await Promise.race([result, new Promise((resolve) => setTimeout(() => resolve(null), 10000))]);
+            if (token) return { executed: true, token, siteKey: true };
+          }
+          return { executed: true, siteKey: true };
+        } catch (e) { lastError = e && e.message ? e.message : String(e); }
+      }
+      return { executed: false, error: lastError || 'execute failed' };
+    }, { widgetIds, siteKey });
+  }
+
+  async _solveInvisible(page, { siteKey, timeout = 120000, language = 'en-US' } = {}) {
+    const executeResult = await this._executeInvisible(page, siteKey);
+    if (executeResult && executeResult.token && executeResult.token.length > 50) {
+      console.log('Invisible execute returned token directly');
+      return executeResult.token;
+    }
+    if (!executeResult || !executeResult.executed) console.log('Invisible execute did not complete directly: ' + (executeResult && executeResult.error ? executeResult.error : 'unknown'));
+    let token = await this._waitForToken(page, 15000);
+    if (token) { console.log('Invisible mode detected page token'); return token; }
+    const challengeFrame = await this._findChallengeFrame(page);
+    if (challengeFrame) {
+      console.log('Invisible mode opened challenge, using audio flow...');
+      const solved = await this._solveAudioChallenge(page, language);
+      if (!solved) throw new RecaptchaSolveError('invisible audio challenge failed');
+      token = await this._waitForToken(page, 15000) || await this._getToken(page);
+      if (token) return token;
+    }
+    throw new RecaptchaSolveError('invisible reCAPTCHA flow finished but no token was extracted');
+  }
   async _clickCheckbox(page) {
     await this._removeBlockingAds(page);
     console.log('🔍 查找 reCAPTCHA 复选框...');
