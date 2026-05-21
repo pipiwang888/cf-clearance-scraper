@@ -60,76 +60,145 @@ def get_random_gemini_api_key():
 
 async def solve_hcaptcha(website_url: str, website_key: str, proxy: str = None):
     """
-    使用原始 hcaptcha-challenger 解决验证码
+    使用 hcaptcha-challenger 自动解决验证码。
+    流程：打开页面 -> 等待/兜底渲染 hCaptcha -> 点击 checkbox -> 等待并自动识别挑战 -> 提取 token。
     """
+    browser = None
     try:
         async with async_playwright() as p:
-            # 使用简单的浏览器配置
             launch_options = {
-                "headless": False,
-                "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+                "headless": os.getenv("HCAPTCHA_HEADLESS", "false").lower() == "true",
+                "args": [
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled"
+                ]
             }
-            
+
             if proxy:
                 launch_options["proxy"] = {"server": proxy}
-            
+
             browser = await p.chromium.launch(**launch_options)
-            context = await browser.new_context()
+            context = await browser.new_context(
+                viewport={"width": 1366, "height": 768},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+            )
             page = await context.new_page()
-            
-            # 导航到目标页面 (使用统一配置的超时时间)
-            page_timeout = int(os.getenv('HCAPTCHA_PAGE_TIMEOUT', '30000'))
-            await page.goto(website_url, timeout=page_timeout)
-            
-            # 随机选择一个API密钥
+
+            # API key 必须在 AgentConfig 创建前写入环境变量，否则配置对象读不到随机选择的 key。
             selected_api_key = get_random_gemini_api_key()
-            
-            # 按照官方示例初始化Agent，传入选择的API密钥
-            agent_config = AgentConfig()
-            
-            # 设置Gemini API密钥到环境变量（hcaptcha-challenger会从环境变量读取）
             os.environ['GEMINI_API_KEY'] = selected_api_key
-            
+
+            agent_config = AgentConfig(
+                GEMINI_API_KEY=selected_api_key,
+                DISABLE_BEZIER_TRAJECTORY=os.getenv('DISABLE_BEZIER_TRAJECTORY', 'false').lower() == 'true',
+                EXECUTION_TIMEOUT=float(os.getenv('HCAPTCHA_EXECUTION_TIMEOUT', os.getenv('HCAPTCHA_SOLVER_TIMEOUT', '300000'))) / 1000,
+                RESPONSE_TIMEOUT=float(os.getenv('HCAPTCHA_RESPONSE_TIMEOUT', '60000')) / 1000,
+                WAIT_FOR_CHALLENGE_VIEW_TO_RENDER_MS=int(os.getenv('HCAPTCHA_CHALLENGE_RENDER_WAIT_MS', '2000')),
+                RETRY_ON_FAILURE=True,
+            )
+
+            # Agent 必须在触发 hCaptcha 前创建，这样才能监听 /getcaptcha/ 和 /checkcaptcha/ 响应。
             agent = AgentV(page=page, agent_config=agent_config)
-            
-            # 按照官方API流程：点击checkbox -> 等待挑战
+
+            page_timeout = int(os.getenv('HCAPTCHA_PAGE_TIMEOUT', '30000'))
+            await page.goto(website_url, wait_until='domcontentloaded', timeout=page_timeout)
+            await page.wait_for_timeout(1500)
+
+            # 等待目标页自身渲染 hCaptcha；如果没有，则用 websiteKey 兜底渲染一个 hCaptcha 容器。
+            has_hcaptcha = await page.locator('iframe[src*="hcaptcha.com"], iframe[src*="newassets.hcaptcha.com"], .h-captcha, [data-sitekey]').count()
+            if not has_hcaptcha:
+                await page.evaluate(
+                    """
+                    async ({ sitekey }) => {
+                        let container = document.querySelector('#codex-hcaptcha-container');
+                        if (!container) {
+                            container = document.createElement('div');
+                            container.id = 'codex-hcaptcha-container';
+                            container.style.cssText = 'position:relative;z-index:2147483647;margin:40px;';
+                            const widget = document.createElement('div');
+                            widget.className = 'h-captcha';
+                            widget.setAttribute('data-sitekey', sitekey);
+                            container.appendChild(widget);
+                            document.body.prepend(container);
+                        }
+                        if (!document.querySelector('script[src*="hcaptcha.com/1/api.js"]')) {
+                            await new Promise((resolve, reject) => {
+                                const script = document.createElement('script');
+                                script.src = 'https://js.hcaptcha.com/1/api.js';
+                                script.async = true;
+                                script.defer = true;
+                                script.onload = resolve;
+                                script.onerror = reject;
+                                document.head.appendChild(script);
+                            });
+                        }
+                    }
+                    """,
+                    {"sitekey": website_key}
+                )
+                await page.wait_for_timeout(3000)
+
+            await page.wait_for_selector('iframe[src*="hcaptcha.com"], iframe[src*="newassets.hcaptcha.com"]', timeout=30000)
+
+            # 点击 checkbox 触发挑战，hcaptcha-challenger 会在 wait_for_challenge 中自动识别图片并提交。
             await agent.robotic_arm.click_checkbox()
-            await agent.wait_for_challenge()
-            
-            await browser.close()
-            
-            # 提取结果 - 按照官方示例
-            if agent.cr_list:
+            signal = await agent.wait_for_challenge()
+
+            # 优先从页面隐藏 textarea 获取真实 token。
+            token = await page.evaluate(
+                """
+                () => {
+                    const selectors = [
+                        'textarea[name="h-captcha-response"]',
+                        'textarea[name="g-recaptcha-response"]',
+                        'input[name="h-captcha-response"]',
+                        'input[name="g-recaptcha-response"]'
+                    ];
+                    for (const selector of selectors) {
+                        const el = document.querySelector(selector);
+                        if (el && el.value && el.value.length > 20) return el.value;
+                    }
+                    if (window.hcaptcha && typeof window.hcaptcha.getResponse === 'function') {
+                        const value = window.hcaptcha.getResponse();
+                        if (value && value.length > 20) return value;
+                    }
+                    return null;
+                }
+                """
+            )
+
+            if not token and agent.cr_list:
                 cr = agent.cr_list[-1]
                 response_data = cr.model_dump(by_alias=True)
-                
-                # 提取token
-                token = None
                 if 'generated_pass_UUID' in response_data:
                     token = response_data['generated_pass_UUID']
                 elif 'c' in response_data and response_data['c'] and 'req' in response_data['c']:
                     token = response_data['c']['req']
-                
-                if token:
-                    return {
-                        "code": 200,
-                        "message": "hCaptcha solved successfully",
-                        "token": token
-                    }
-                else:
-                    return {
-                        "code": 500,
-                        "message": "Failed to extract token from response",
-                        "token": None
-                    }
-            else:
+
+            await browser.close()
+
+            if token:
                 return {
-                    "code": 500,
-                    "message": "No challenge response found",
-                    "token": None
+                    "code": 200,
+                    "message": "hCaptcha solved successfully",
+                    "token": token,
+                    "challengeSignal": str(signal)
                 }
-                
+
+            return {
+                "code": 500,
+                "message": f"hCaptcha challenge finished but no token was extracted; signal={signal}",
+                "token": None
+            }
+
     except Exception as e:
+        try:
+            if browser:
+                await browser.close()
+        except Exception:
+            pass
         return {
             "code": 500,
             "message": f"Error: {str(e)}",
