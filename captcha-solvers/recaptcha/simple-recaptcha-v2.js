@@ -51,7 +51,7 @@ class SimpleRecaptchaV2Solver {
       // 2. 查找并点击 reCAPTCHA 复选框
       if (method === 'invisible' || invisible) {
         console.log('Starting reCAPTCHA v2 invisible mode...');
-        const token = await this._solveInvisible(page, { siteKey, timeout, language, startTime, submitSelector: options.submitSelector });
+        const token = await this._solveInvisible(page, { siteKey, timeout, language, startTime, submitSelector: options.submitSelector, formData: options.formData, webAddress: options.webAddress });
         return { success: true, token, challengeType: 'invisible', solveTime: Date.now() - startTime };
       }
       const checkboxClicked = await this._clickCheckbox(page);
@@ -247,11 +247,52 @@ class SimpleRecaptchaV2Solver {
     }
     return null;
   }
-  async _clickInvisibleSubmitTrigger(page, submitSelector = null) {
+  async _fillInvisibleFormFields(page, { formData = null, webAddress = null } = {}) {
+    const data = Object.assign({}, formData || {});
+    if (webAddress) data.web_address = webAddress;
+    if (!data.web_address) data.web_address = 'hax.co.id';
+
+    try {
+      const filled = await page.evaluate((data) => {
+        let count = 0;
+        for (const [name, value] of Object.entries(data)) {
+          const selectors = [
+            `[name="${CSS.escape(name)}"]`,
+            `#${CSS.escape(name)}`,
+            `input[placeholder="${CSS.escape(value)}"]`
+          ];
+          for (const selector of selectors) {
+            const el = document.querySelector(selector);
+            if (!el) continue;
+            el.focus();
+            el.value = value;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.blur();
+            count++;
+            break;
+          }
+        }
+        return count;
+      }, data);
+      if (filled > 0) {
+        console.log('Invisible form fields filled: ' + filled);
+        await this._sleep(500);
+      }
+      return filled;
+    } catch (e) {
+      console.log('Invisible form fill failed: ' + e.message);
+      return 0;
+    }
+  }
+  async _clickInvisibleSubmitTrigger(page, submitSelector = null, fillOptions = {}) {
     await this._removeBlockingAds(page);
+    await this._fillInvisibleFormFields(page, fillOptions);
     const selectors = [];
     if (submitSelector) selectors.push(submitSelector);
     selectors.push(
+      'button[name="submit_button"]',
+      'button.btn.btn-primary',
       'button.g-recaptcha',
       'input.g-recaptcha',
       '.g-recaptcha[data-size="invisible"]',
@@ -366,9 +407,9 @@ class SimpleRecaptchaV2Solver {
     }, { widgetIds, siteKey });
   }
 
-  async _solveInvisible(page, { siteKey, timeout = 120000, language = 'en-US', submitSelector = null } = {}) {
+  async _solveInvisible(page, { siteKey, timeout = 120000, language = 'en-US', submitSelector = null, formData = null, webAddress = null } = {}) {
     await this._installInvisibleTokenCapture(page);
-    const clickedSubmit = await this._clickInvisibleSubmitTrigger(page, submitSelector);
+    const clickedSubmit = await this._clickInvisibleSubmitTrigger(page, submitSelector, { formData, webAddress });
     if (clickedSubmit) {
       const clickedResult = await this._waitForTokenOrChallenge(page, 15000);
       if (clickedResult.type === 'token') {

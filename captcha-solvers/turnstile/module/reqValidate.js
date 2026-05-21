@@ -55,6 +55,18 @@ const schema = {
         },
         "action": {
             "type": "string"
+        },
+        "submitSelector": {
+            "type": "string"
+        },
+        "webAddress": {
+            "type": "string"
+        },
+        "web_address": {
+            "type": "string"
+        },
+        "formData": {
+            "type": "object"
         }
     },
     "anyOf": [

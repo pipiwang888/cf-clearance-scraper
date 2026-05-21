@@ -299,7 +299,9 @@ async function handleRecaptchaV2Solve(data) {
             method: data.method || 'audio',
             invisible: data.invisible === true || data.method === 'invisible',
             siteKey: data.siteKey || data.websiteKey,
-            submitSelector: data.submitSelector
+            submitSelector: data.submitSelector,
+            formData: data.formData,
+            webAddress: data.webAddress || data.web_address
         });
 
         console.log('✅ reCAPTCHA v2 解决成功');
