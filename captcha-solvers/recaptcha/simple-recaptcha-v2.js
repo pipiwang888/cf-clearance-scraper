@@ -198,6 +198,55 @@ class SimpleRecaptchaV2Solver {
     } catch (e) { return false; }
   }
 
+  async _installInvisibleTokenCapture(page) {
+    try {
+      await page.evaluate(() => {
+        window.__codexRecaptchaTokens = window.__codexRecaptchaTokens || [];
+        const install = () => {
+          if (!window.grecaptcha || typeof window.grecaptcha.execute !== 'function' || window.grecaptcha.__codexExecuteWrapped) return;
+          const originalExecute = window.grecaptcha.execute.bind(window.grecaptcha);
+          window.grecaptcha.execute = function(...args) {
+            const result = originalExecute(...args);
+            if (result && typeof result.then === 'function') {
+              result.then((token) => {
+                if (token && String(token).length > 50) window.__codexRecaptchaTokens.push(String(token));
+              }).catch(() => {});
+            } else if (result && String(result).length > 50) {
+              window.__codexRecaptchaTokens.push(String(result));
+            }
+            return result;
+          };
+          window.grecaptcha.__codexExecuteWrapped = true;
+        };
+        install();
+        let tries = 0;
+        const timer = setInterval(() => {
+          install();
+          if (++tries > 60 || (window.grecaptcha && window.grecaptcha.__codexExecuteWrapped)) clearInterval(timer);
+        }, 250);
+      });
+    } catch (e) {}
+  }
+
+  async _waitForTokenOrChallenge(page, timeout = 15000) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const token = await this._getToken(page, { quiet: true });
+      if (token) return { type: 'token', token };
+      const frame = await this._findChallengeFrameQuick(page);
+      if (frame) return { type: 'challenge' };
+      await this._sleep(500);
+    }
+    return { type: 'timeout' };
+  }
+
+  async _findChallengeFrameQuick(page) {
+    for (const frame of page.frames()) {
+      const url = frame.url();
+      if (this._isRecaptchaFrame(url) && !this._isAdFrame(url) && (url.includes('bframe') || url.includes('challenge'))) return frame;
+    }
+    return null;
+  }
   async _clickInvisibleSubmitTrigger(page, submitSelector = null) {
     await this._removeBlockingAds(page);
     const selectors = [];
@@ -208,7 +257,14 @@ class SimpleRecaptchaV2Solver {
       '.g-recaptcha[data-size="invisible"]',
       'button[type="submit"]',
       'input[type="submit"]',
-      '[type="submit"]'
+      'button[type="button"]',
+      'input[type="button"]',
+      '[type="submit"]',
+      '[onclick*="grecaptcha"]',
+      '[onclick*="recaptcha"]',
+      '[onclick*="renew" i]',
+      '.btn',
+      'button'
     );
 
     for (const selector of selectors) {
@@ -216,7 +272,12 @@ class SimpleRecaptchaV2Solver {
         const clicked = await page.evaluate((selector) => {
           const el = document.querySelector(selector);
           if (!el) return false;
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          if (!rect.width || !rect.height || style.visibility === 'hidden' || style.display === 'none' || el.disabled) return false;
           el.scrollIntoView({ block: 'center', inline: 'center' });
+          el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+          el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
           el.click();
           return true;
         }, selector);
@@ -230,10 +291,13 @@ class SimpleRecaptchaV2Solver {
 
     try {
       const clickedByText = await page.evaluate(() => {
-        const candidates = [...document.querySelectorAll('button, input[type="button"], input[type="submit"], a, [role="button"]')];
+        const candidates = [...document.querySelectorAll('button, input[type="button"], input[type="submit"], .btn, [onclick], a, [role="button"]')];
         const match = candidates.find((el) => {
           const text = [el.innerText, el.textContent, el.value, el.id, el.className, el.getAttribute('aria-label'), el.getAttribute('title')]
             .filter(Boolean).join(' ').toLowerCase();
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          if (!rect.width || !rect.height || style.visibility === 'hidden' || style.display === 'none' || el.disabled) return false;
           return text.includes('renew') || text.includes('submit') || text.includes('send') || text.includes('continue') || text.includes('verify');
         });
         if (!match) return false;
@@ -243,6 +307,22 @@ class SimpleRecaptchaV2Solver {
       });
       if (clickedByText) {
         console.log('Invisible trigger clicked by text fallback');
+        await this._sleep(3000);
+        return true;
+      }
+    } catch (e) {}
+
+    try {
+      const submitted = await page.evaluate(() => {
+        const forms = [...document.querySelectorAll('form')];
+        const form = forms.find((f) => f.querySelector('.g-recaptcha, [data-sitekey], iframe[src*="recaptcha"]')) || forms[0];
+        if (!form) return false;
+        if (typeof form.requestSubmit === 'function') form.requestSubmit();
+        else form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+        return true;
+      });
+      if (submitted) {
+        console.log('Invisible trigger submitted form fallback');
         await this._sleep(3000);
         return true;
       }
@@ -287,12 +367,20 @@ class SimpleRecaptchaV2Solver {
   }
 
   async _solveInvisible(page, { siteKey, timeout = 120000, language = 'en-US', submitSelector = null } = {}) {
+    await this._installInvisibleTokenCapture(page);
     const clickedSubmit = await this._clickInvisibleSubmitTrigger(page, submitSelector);
     if (clickedSubmit) {
-      const clickedToken = await this._waitForToken(page, 12000);
-      if (clickedToken) {
+      const clickedResult = await this._waitForTokenOrChallenge(page, 15000);
+      if (clickedResult.type === 'token') {
         console.log('Invisible submit click produced token');
-        return clickedToken;
+        return clickedResult.token;
+      }
+      if (clickedResult.type === 'challenge') {
+        console.log('Invisible submit click opened challenge, using audio flow...');
+        const solved = await this._solveAudioChallenge(page, language);
+        if (!solved) throw new RecaptchaSolveError('invisible submit audio challenge failed');
+        const token = await this._waitForToken(page, 15000) || await this._getToken(page);
+        if (token) return token;
       }
     }
 
@@ -766,6 +854,10 @@ class SimpleRecaptchaV2Solver {
    */
   async _getToken(page, options = {}) {
     const methods = [
+      () => page.evaluate(() => {
+        const list = window.__codexRecaptchaTokens || [];
+        return list.length ? list[list.length - 1] : null;
+      }),
       // 方法1: 查找隐藏的 textarea
       () => page.evaluate(() => {
         const textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
