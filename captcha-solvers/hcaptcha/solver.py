@@ -58,6 +58,35 @@ def get_random_gemini_api_key():
     # 没有配置任何密钥
     raise ValueError("未配置任何Gemini API密钥。请设置GEMINI_API_KEY或GEMINI_API_KEYS环境变量")
 
+async def click_hcaptcha_checkbox(page, agent):
+    """Click hCaptcha checkbox with broad selector fallback."""
+    selectors = [
+        'iframe[src*="frame=checkbox"]',
+        'iframe[src*="checkbox"]',
+        'iframe[src*="newassets.hcaptcha.com"]',
+        'iframe[src*="hcaptcha.com"]'
+    ]
+
+    for selector in selectors:
+        try:
+            iframe = page.locator(selector).first
+            await iframe.wait_for(state='visible', timeout=8000)
+            box = await iframe.bounding_box()
+            if box:
+                await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2, delay=150)
+                await page.wait_for_timeout(1000)
+                return True
+        except Exception:
+            pass
+
+    # fallback to upstream robotic arm selector
+    try:
+        await agent.robotic_arm.click_checkbox()
+        await page.wait_for_timeout(1000)
+        return True
+    except Exception as err:
+        raise RuntimeError(f"failed to click hCaptcha checkbox: {err}")
+
 async def solve_hcaptcha(website_url: str, website_key: str, proxy: str = None):
     """
     使用 hcaptcha-challenger 自动解决验证码。
@@ -143,7 +172,7 @@ async def solve_hcaptcha(website_url: str, website_key: str, proxy: str = None):
             await page.wait_for_selector('iframe[src*="hcaptcha.com"], iframe[src*="newassets.hcaptcha.com"]', timeout=30000)
 
             # 点击 checkbox 触发挑战，hcaptcha-challenger 会在 wait_for_challenge 中自动识别图片并提交。
-            await agent.robotic_arm.click_checkbox()
+            await click_hcaptcha_checkbox(page, agent)
             signal = await agent.wait_for_challenge()
 
             # 优先从页面隐藏 textarea 获取真实 token。
