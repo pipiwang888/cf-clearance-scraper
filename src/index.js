@@ -273,7 +273,9 @@ async function createProxiedRecaptchaBrowser(proxy) {
 async function handleRecaptchaV2Solve(data) {
     let context = null;
     let proxyBrowser = null;
+    const isInvisibleMode = data.method === 'invisible' || data.invisible === true;
     const useProxyBrowser = !!data.proxy;
+    const useIsolatedContext = useProxyBrowser || isInvisibleMode;
     try {
         console.log('🤖 使用内置 JS reCAPTCHA v2 解决器...');
 
@@ -282,6 +284,10 @@ async function handleRecaptchaV2Solve(data) {
             console.log(`🌐 reCAPTCHA v2 使用独立代理浏览器: ${proxyConfig.host}:${proxyConfig.port}`);
             proxyBrowser = await createProxiedRecaptchaBrowser(data.proxy);
             context = await proxyBrowser.createBrowserContext({ ignoreHTTPSErrors: true });
+        } else if (isInvisibleMode) {
+            if (!global.browser) throw new Error('Browser is not ready');
+            console.log('reCAPTCHA v2 invisible uses isolated context');
+            context = await global.browser.createBrowserContext({ ignoreHTTPSErrors: true });
         } else {
             if (!global.contextPool) throw new Error('Browser context pool is not ready');
             context = await global.contextPool.getContext();
@@ -291,11 +297,14 @@ async function handleRecaptchaV2Solve(data) {
         const page = await context.newPage();
         console.log(`🔗 导航到: ${data.url}`);
         await page.goto(data.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await waitForChallengeAndCleanAds(page, {
-            timeout: Number(process.env.RECAPTCHA_PAGE_READY_TIMEOUT) || 120000,
-            requireRecaptcha: data.method !== 'invisible',
-            ignoreRecaptchaReady: data.method === 'invisible'
-        });
+        if (isInvisibleMode) {
+            await page.waitForFunction(() => document.readyState === 'interactive' || document.readyState === 'complete', { timeout: 15000 }).catch(() => null);
+            await cleanAdFrames(page).catch(() => {});
+            await new Promise(resolve => setTimeout(resolve, 1200));
+            console.log('invisible page DOM ready, skip CF/reCAPTCHA wait loop');
+        } else {
+            await waitForChallengeAndCleanAds(page, { timeout: Number(process.env.RECAPTCHA_PAGE_READY_TIMEOUT) || 120000 });
+        }
 
         const solver = new SimpleRecaptchaV2Solver();
         const result = await solver.solve(page, {
@@ -327,12 +336,12 @@ async function handleRecaptchaV2Solve(data) {
         console.error('❌ reCAPTCHA v2 解决失败:', error.message);
         throw error;
     } finally {
-        if (useProxyBrowser) {
+        if (useIsolatedContext) {
             if (context) {
-                try { await context.close(); } catch (e) { console.warn('关闭代理上下文时出现警告:', e.message); }
+                try { await context.close(); } catch (e) { console.warn('close isolated context warning:', e.message); }
             }
             if (proxyBrowser) {
-                try { await proxyBrowser.close(); } catch (e) { console.warn('关闭代理浏览器时出现警告:', e.message); }
+                try { await proxyBrowser.close(); } catch (e) { console.warn('close proxy browser warning:', e.message); }
             }
         } else if (context && global.contextPool) {
             try { await global.contextPool.releaseContext(context); } catch (e) { console.warn('释放浏览器上下文时出现警告:', e.message); }

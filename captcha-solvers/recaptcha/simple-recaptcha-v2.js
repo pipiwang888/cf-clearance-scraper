@@ -181,7 +181,32 @@ class SimpleRecaptchaV2Solver {
     if (!siteKey) return false;
     try {
       return await page.evaluate(async ({ siteKey }) => {
+        async function waitForGrecaptcha(timeout = 15000) {
+          const started = Date.now();
+          while (Date.now() - started < timeout) {
+            if (window.grecaptcha && typeof window.grecaptcha.render === 'function' && typeof window.grecaptcha.execute === 'function') return true;
+            await new Promise(resolve => setTimeout(resolve, 250));
+          }
+          return false;
+        }
+
+        if (!window.grecaptcha || typeof window.grecaptcha.render !== 'function') {
+          if (!document.querySelector('script[src*="recaptcha/api.js"]')) {
+            await new Promise((resolve, reject) => {
+              const script = document.createElement('script');
+              script.src = 'https://www.recaptcha.net/recaptcha/api.js?render=explicit&hl=en';
+              script.async = true;
+              script.defer = true;
+              script.onload = resolve;
+              script.onerror = reject;
+              document.head.appendChild(script);
+            }).catch(() => null);
+          }
+          await waitForGrecaptcha(20000);
+        }
+
         if (!window.grecaptcha || typeof window.grecaptcha.render !== 'function') return false;
+
         let container = document.querySelector('#codex-recaptcha-v2-invisible');
         if (!container) {
           container = document.createElement('div');
@@ -195,7 +220,10 @@ class SimpleRecaptchaV2Solver {
         }
         return true;
       }, { siteKey });
-    } catch (e) { return false; }
+    } catch (e) {
+      console.log('ensure invisible widget failed: ' + e.message);
+      return false;
+    }
   }
 
   async _installInvisibleTokenCapture(page) {
@@ -247,6 +275,81 @@ class SimpleRecaptchaV2Solver {
     }
     return null;
   }
+  async _waitUntilAdFree(page, { timeout = 30000, stableRounds = 2 } = {}) {
+    const deadline = Date.now() + timeout;
+    let stable = 0;
+    while (Date.now() < deadline) {
+      const state = await page.evaluate(() => {
+        const adPatterns = [
+          'fc-message-root',
+          'google_vignette',
+          'googlesyndication',
+          'googleads',
+          'doubleclick',
+          'adservice.google',
+          'pagead',
+          'adsbygoogle',
+          'securepubads'
+        ];
+        const removed = [];
+        const isAdText = (value) => adPatterns.some((p) => String(value || '').toLowerCase().includes(p));
+
+        const selectors = [
+          '.fc-message-root',
+          '[class*="fc-message-root"]',
+          '[id*="google_vignette"]',
+          '[class*="google_vignette"]',
+          'ins.adsbygoogle',
+          'iframe[src*="googleads"]',
+          'iframe[src*="googlesyndication"]',
+          'iframe[src*="doubleclick"]',
+          'iframe[src*="adservice.google"]'
+        ];
+
+        for (const selector of selectors) {
+          for (const el of document.querySelectorAll(selector)) {
+            removed.push(selector);
+            el.remove();
+          }
+        }
+
+        for (const el of [...document.querySelectorAll('div, section, aside, iframe')]) {
+          const text = [el.id, el.className, el.getAttribute('src'), el.getAttribute('name')].filter(Boolean).join(' ');
+          if (isAdText(text)) {
+            removed.push(text.slice(0, 80));
+            el.remove();
+          }
+        }
+
+        document.documentElement.style.overflow = 'auto';
+        if (document.body) {
+          document.body.style.overflow = 'auto';
+          document.body.style.pointerEvents = 'auto';
+        }
+
+        const remaining = [...document.querySelectorAll('.fc-message-root, [class*="fc-message-root"], [id*="google_vignette"], [class*="google_vignette"], ins.adsbygoogle')].length;
+        return { removed: removed.length, remaining };
+      }).catch(() => ({ removed: 0, remaining: 0 }));
+
+      if (state.removed > 0) {
+        console.log('Invisible ad cleanup removed: ' + state.removed);
+        stable = 0;
+        await this._sleep(800);
+        continue;
+      }
+
+      if (state.remaining === 0) stable++;
+      else stable = 0;
+
+      if (stable >= stableRounds) {
+        console.log('Invisible page ad-free, continue form submit');
+        return true;
+      }
+      await this._sleep(600);
+    }
+    console.log('Invisible ad wait timeout, continue anyway');
+    return false;
+  }
   async _fillInvisibleFormFields(page, { formData = null, webAddress = null } = {}) {
     const data = Object.assign({}, formData || {});
     if (webAddress) data.web_address = webAddress;
@@ -285,8 +388,34 @@ class SimpleRecaptchaV2Solver {
       return 0;
     }
   }
+  async _fastAdCleanup(page, rounds = 3, delay = 120) {
+    let total = 0;
+    for (let i = 0; i < rounds; i++) {
+      const removed = await page.evaluate(() => {
+        const patterns = ['fc-message-root', 'google_vignette', 'googlesyndication', 'googleads', 'doubleclick', 'adservice.google', 'pagead', 'adsbygoogle', 'securepubads'];
+        const isAd = (v) => patterns.some((p) => String(v || '').toLowerCase().includes(p));
+        let count = 0;
+        const selectors = ['.fc-message-root', '[class*="fc-message-root"]', '[id*="google_vignette"]', '[class*="google_vignette"]', 'ins.adsbygoogle', 'iframe[src*="googleads"]', 'iframe[src*="googlesyndication"]', 'iframe[src*="doubleclick"]', 'iframe[src*="adservice.google"]'];
+        for (const selector of selectors) {
+          for (const el of document.querySelectorAll(selector)) { el.remove(); count++; }
+        }
+        for (const el of [...document.querySelectorAll('div, section, aside, iframe')]) {
+          const meta = [el.id, el.className, el.getAttribute('src'), el.getAttribute('name')].filter(Boolean).join(' ');
+          if (isAd(meta)) { el.remove(); count++; }
+        }
+        document.documentElement.style.overflow = 'auto';
+        if (document.body) { document.body.style.overflow = 'auto'; document.body.style.pointerEvents = 'auto'; }
+        return count;
+      }).catch(() => 0);
+      total += removed;
+      if (delay) await this._sleep(delay);
+    }
+    if (total > 0) console.log('Invisible fast ad cleanup removed: ' + total);
+    return total;
+  }
   async _clickInvisibleSubmitTrigger(page, submitSelector = null, fillOptions = {}) {
     await this._removeBlockingAds(page);
+    await this._waitUntilAdFree(page, { timeout: 8000, stableRounds: 1 });
     await this._fillInvisibleFormFields(page, fillOptions);
     const selectors = [];
     if (submitSelector) selectors.push(submitSelector);
@@ -310,6 +439,7 @@ class SimpleRecaptchaV2Solver {
 
     for (const selector of selectors) {
       try {
+        await this._fastAdCleanup(page, 2, 80);
         const clicked = await page.evaluate((selector) => {
           const el = document.querySelector(selector);
           if (!el) return false;
@@ -371,10 +501,29 @@ class SimpleRecaptchaV2Solver {
 
     return false;
   }
+  async _clickInvisibleSubmitWithRetries(page, submitSelector = null, fillOptions = {}, language = 'en-US') {
+    const attempts = 5;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      await this._fastAdCleanup(page, 3, 80);
+      const clicked = await this._clickInvisibleSubmitTrigger(page, submitSelector, fillOptions);
+      if (!clicked) {
+        console.log('Invisible submit attempt ' + attempt + ' did not click a trigger');
+        await this._sleep(700);
+        continue;
+      }
+      const result = await this._waitForTokenOrChallenge(page, 5000);
+      if (result.type === 'token') return result;
+      if (result.type === 'challenge') return result;
+      console.log('Invisible submit attempt ' + attempt + ' produced no token/challenge, retrying');
+      await this._fastAdCleanup(page, 4, 100);
+      await this._sleep(600);
+    }
+    return { type: 'timeout' };
+  }
   async _executeInvisible(page, siteKey) {
     await this._removeBlockingAds(page);
-    await page.waitForSelector('iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net/recaptcha"], .g-recaptcha, [data-sitekey]', { timeout: 30000 }).catch(() => null);
     await this._ensureInvisibleWidget(page, siteKey);
+    await page.waitForSelector('iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net/recaptcha"], .g-recaptcha, [data-sitekey], #codex-recaptcha-v2-invisible', { timeout: 10000 }).catch(() => null);
     const widgetIds = await this._findRecaptchaWidgetIds(page);
     console.log('Invisible widget ids: ' + (widgetIds.length ? widgetIds.join(',') : 'none'));
     return await page.evaluate(async ({ widgetIds, siteKey }) => {
@@ -409,20 +558,17 @@ class SimpleRecaptchaV2Solver {
 
   async _solveInvisible(page, { siteKey, timeout = 120000, language = 'en-US', submitSelector = null, formData = null, webAddress = null } = {}) {
     await this._installInvisibleTokenCapture(page);
-    const clickedSubmit = await this._clickInvisibleSubmitTrigger(page, submitSelector, { formData, webAddress });
-    if (clickedSubmit) {
-      const clickedResult = await this._waitForTokenOrChallenge(page, 15000);
-      if (clickedResult.type === 'token') {
-        console.log('Invisible submit click produced token');
-        return clickedResult.token;
-      }
-      if (clickedResult.type === 'challenge') {
-        console.log('Invisible submit click opened challenge, using audio flow...');
-        const solved = await this._solveAudioChallenge(page, language);
-        if (!solved) throw new RecaptchaSolveError('invisible submit audio challenge failed');
-        const token = await this._waitForToken(page, 15000) || await this._getToken(page);
-        if (token) return token;
-      }
+    const clickedResult = await this._clickInvisibleSubmitWithRetries(page, submitSelector, { formData, webAddress }, language);
+    if (clickedResult.type === 'token') {
+      console.log('Invisible submit click produced token');
+      return clickedResult.token;
+    }
+    if (clickedResult.type === 'challenge') {
+      console.log('Invisible submit click opened challenge, using audio flow...');
+      const solved = await this._solveAudioChallenge(page, language);
+      if (!solved) throw new RecaptchaSolveError('invisible submit audio challenge failed');
+      const token = await this._waitForToken(page, 15000) || await this._getToken(page);
+      if (token) return token;
     }
 
     const executeResult = await this._executeInvisible(page, siteKey);
