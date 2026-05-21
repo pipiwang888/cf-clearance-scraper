@@ -298,7 +298,8 @@ async function handleRecaptchaV2Solve(data) {
             timeout: Number(process.env.RECAPTCHA_TIMEOUT) || 180000,
             method: data.method || 'audio',
             invisible: data.invisible === true || data.method === 'invisible',
-            siteKey: data.siteKey || data.websiteKey
+            siteKey: data.siteKey || data.websiteKey,
+            submitSelector: data.submitSelector
         });
 
         console.log('✅ reCAPTCHA v2 解决成功');

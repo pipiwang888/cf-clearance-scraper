@@ -51,7 +51,7 @@ class SimpleRecaptchaV2Solver {
       // 2. 查找并点击 reCAPTCHA 复选框
       if (method === 'invisible' || invisible) {
         console.log('Starting reCAPTCHA v2 invisible mode...');
-        const token = await this._solveInvisible(page, { siteKey, timeout, language, startTime });
+        const token = await this._solveInvisible(page, { siteKey, timeout, language, startTime, submitSelector: options.submitSelector });
         return { success: true, token, challengeType: 'invisible', solveTime: Date.now() - startTime };
       }
       const checkboxClicked = await this._clickCheckbox(page);
@@ -198,6 +198,58 @@ class SimpleRecaptchaV2Solver {
     } catch (e) { return false; }
   }
 
+  async _clickInvisibleSubmitTrigger(page, submitSelector = null) {
+    await this._removeBlockingAds(page);
+    const selectors = [];
+    if (submitSelector) selectors.push(submitSelector);
+    selectors.push(
+      'button.g-recaptcha',
+      'input.g-recaptcha',
+      '.g-recaptcha[data-size="invisible"]',
+      'button[type="submit"]',
+      'input[type="submit"]',
+      '[type="submit"]'
+    );
+
+    for (const selector of selectors) {
+      try {
+        const clicked = await page.evaluate((selector) => {
+          const el = document.querySelector(selector);
+          if (!el) return false;
+          el.scrollIntoView({ block: 'center', inline: 'center' });
+          el.click();
+          return true;
+        }, selector);
+        if (clicked) {
+          console.log('Invisible trigger clicked selector: ' + selector);
+          await this._sleep(3000);
+          return true;
+        }
+      } catch (e) {}
+    }
+
+    try {
+      const clickedByText = await page.evaluate(() => {
+        const candidates = [...document.querySelectorAll('button, input[type="button"], input[type="submit"], a, [role="button"]')];
+        const match = candidates.find((el) => {
+          const text = [el.innerText, el.textContent, el.value, el.id, el.className, el.getAttribute('aria-label'), el.getAttribute('title')]
+            .filter(Boolean).join(' ').toLowerCase();
+          return text.includes('renew') || text.includes('submit') || text.includes('send') || text.includes('continue') || text.includes('verify');
+        });
+        if (!match) return false;
+        match.scrollIntoView({ block: 'center', inline: 'center' });
+        match.click();
+        return true;
+      });
+      if (clickedByText) {
+        console.log('Invisible trigger clicked by text fallback');
+        await this._sleep(3000);
+        return true;
+      }
+    } catch (e) {}
+
+    return false;
+  }
   async _executeInvisible(page, siteKey) {
     await this._removeBlockingAds(page);
     await page.waitForSelector('iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net/recaptcha"], .g-recaptcha, [data-sitekey]', { timeout: 30000 }).catch(() => null);
@@ -234,7 +286,16 @@ class SimpleRecaptchaV2Solver {
     }, { widgetIds, siteKey });
   }
 
-  async _solveInvisible(page, { siteKey, timeout = 120000, language = 'en-US' } = {}) {
+  async _solveInvisible(page, { siteKey, timeout = 120000, language = 'en-US', submitSelector = null } = {}) {
+    const clickedSubmit = await this._clickInvisibleSubmitTrigger(page, submitSelector);
+    if (clickedSubmit) {
+      const clickedToken = await this._waitForToken(page, 12000);
+      if (clickedToken) {
+        console.log('Invisible submit click produced token');
+        return clickedToken;
+      }
+    }
+
     const executeResult = await this._executeInvisible(page, siteKey);
     if (executeResult && executeResult.token && executeResult.token.length > 50) {
       console.log('Invisible execute returned token directly');
