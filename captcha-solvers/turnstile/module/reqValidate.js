@@ -51,7 +51,7 @@ const schema = {
         },
         "method": {
             "type": "string",
-            "enum": ["audio", "image"]
+            "enum": ["audio", "image", "invisible"]
         },
         "action": {
             "type": "string"
