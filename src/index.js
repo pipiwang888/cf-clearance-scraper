@@ -83,6 +83,7 @@ const RecaptchaV3Solver = require('../captcha-solvers/recaptcha/recaptchav3/inde
 async function waitForChallengeAndCleanAds(page, options = {}) {
     const timeout = options.timeout || Number(process.env.RECAPTCHA_PAGE_READY_TIMEOUT) || 120000;
     const requireRecaptcha = options.requireRecaptcha !== false;
+    const ignoreRecaptchaReady = options.ignoreRecaptchaReady === true;
     const started = Date.now();
     let lastState = null;
 
@@ -120,7 +121,7 @@ async function waitForChallengeAndCleanAds(page, options = {}) {
             error: error.message
         }));
 
-        if (!lastState.hasCf && (!requireRecaptcha || lastState.hasRecaptcha)) {
+        if (!lastState.hasCf && (ignoreRecaptchaReady || !requireRecaptcha || lastState.hasRecaptcha)) {
             console.log(`✅ 页面已就绪: recaptcha=${lastState.hasRecaptcha}, frames=${lastState.frameCount}`);
             return lastState;
         }
@@ -290,7 +291,11 @@ async function handleRecaptchaV2Solve(data) {
         const page = await context.newPage();
         console.log(`🔗 导航到: ${data.url}`);
         await page.goto(data.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await waitForChallengeAndCleanAds(page, { timeout: Number(process.env.RECAPTCHA_PAGE_READY_TIMEOUT) || 120000 });
+        await waitForChallengeAndCleanAds(page, {
+            timeout: Number(process.env.RECAPTCHA_PAGE_READY_TIMEOUT) || 120000,
+            requireRecaptcha: data.method !== 'invisible',
+            ignoreRecaptchaReady: data.method === 'invisible'
+        });
 
         const solver = new SimpleRecaptchaV2Solver();
         const result = await solver.solve(page, {
